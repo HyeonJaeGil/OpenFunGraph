@@ -23,11 +23,11 @@ conda install pytorch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 pytorch-cuda=
 conda install -c pytorch faiss-cpu=1.7.4 mkl=2021 blas=1.0=mkl
 
 # Install Pytorch3D by 
-https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md
-# We recommend installing from a local clone to avoid confliction
+conda install https://anaconda.org/pytorch3d/pytorch3d/0.7.8/download/linux-64/pytorch3d-0.7.8-py38_cu118_pyt212.tar.bz2
 
 # Install the required libraries
-pip install tyro open_clip_torch wandb h5py openai hydra-core distinctipy pyviz3d line_profiler
+pip install tyro open_clip_torch==2.18.0 wandb h5py openai hydra-core distinctipy pyviz3d line_profiler
+pip install "opencv-python<4.10" "numpy==1.26.4" "open3d==0.18.0"
 
 # Install the gradslam package and its dependencies
 git clone https://github.com/krrish94/chamferdist.git
@@ -63,6 +63,16 @@ export CUDA_HOME=/path/to/anaconda3/envs/openfungraph/
 
 You also need to download `ram_swin_large_14m.pth`, `groundingdino_swint_ogc.pth`, `sam_vit_h_4b8939.pth` following the instruction [here](https://github.com/IDEA-Research/Grounded-Segment-Anything#label-grounded-sam-with-ram-or-tag2text-for-automatic-labeling). 
 
+```bash
+export AM_I_DOCKER=False
+export BUILD_WITH_CUDA=True
+export CUDA_HOME=/usr/local/cuda-11.8
+pip install --no-build-isolation -e GroundingDINO
+pip install --upgrade diffusers[torch]
+pip install -r ./recognize-anything/requirements.txt
+pip install -e ./recognize-anything/
+```
+
 After installation, set the path to Grounded-SAM as an environment variable.
 
 ```bash
@@ -72,6 +82,12 @@ export GSA_PATH=/path/to/Grounded-Segment-Anything
 ### Set up LLaVA
 
 Follow the instructions on the [LLaVA repo](https://github.com/haotian-liu/LLaVA) to set it up. We have tested with model checkpoint `LLaVA-7B-v1.6`.
+
+```bash
+git clone https://github.com/haotian-liu/LLaVA.git
+cd LLaVA/
+pip install -e .
+```
 
 ### Install this repo
 
