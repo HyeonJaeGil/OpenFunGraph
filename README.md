@@ -7,6 +7,25 @@
 
 ## Setup
 
+### Shortcut
+```bash
+
+# assume that chamferdist, gradslam, Grounded-Segment-Anything, LLaVA are cloned under OpenFunGraph repo.
+cd OpenFunGraph/
+pip install chamferdist/
+pip install gradslam/
+pip install Grounded-Segment-Anything/segment_anything/
+pip install -e --no-build-isolation Grounded-Segment-Anything/GroundingDINO/
+pip install --no-build-isolation -e Grounded-Segment-Anything/GroundingDINO/
+pip install --upgrade diffusers[torch]
+pip install -r ./Grounded-Segment-Anything/recognize-anything/requirements.txt 
+pip install -e ./Grounded-Segment-Anything/recognize-anything/
+pip install -e LLaVA/
+pip install -e .
+
+```
+
+
 ### Install the required libraries
 
 ```bash
