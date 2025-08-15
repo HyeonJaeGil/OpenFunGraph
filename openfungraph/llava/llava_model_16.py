@@ -121,3 +121,10 @@ class LlavaModel16():
 
         outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
         return outputs
+    
+    def delete(self):
+        del self.model
+        del self.tokenizer
+        del self.image_processor
+        torch.cuda.empty_cache()
+        print("LlavaModel16 resources released.")

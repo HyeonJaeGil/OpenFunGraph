@@ -413,6 +413,7 @@ def extract_node_captions(args, results):
     with open(Path(args.cachedir) / "cfslam_llava_captions.json", "w", encoding="utf-8") as f:
         json.dump(caption_dict_list, f, indent=4, sort_keys=False)
 
+    chat.delete()
 
 def refine_node_captions(args):
     # Load the captions for each segment
@@ -768,6 +769,7 @@ def extract_part_captions(args, results, part_results):
     with open(Path(args.cachedir) / "part_llava_captions.json", "w", encoding="utf-8") as f:
         json.dump(caption_dict_list, f, indent=4, sort_keys=False)
 
+    chat.delete()
 
 def build_rigid_funcgraph(args, results, part_results):
 
@@ -1556,6 +1558,8 @@ def prune_graph(args, results, func_edges):
     with open(Path(edge_file.split('.')[-2]+'_confidence.pkl'), "wb") as f:
         pkl.dump(func_edges, f)
         print('Save edges with confidence!')
+    
+    chat.delete()
 
 
 def main():
