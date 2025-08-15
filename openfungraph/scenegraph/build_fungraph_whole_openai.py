@@ -364,12 +364,12 @@ def extract_node_captions(args, results):
                 else:
                     query = "Describe the main object in the image."
                 # It might be a " + class_name + ", with confidence of " + f"{obj['conf'][idx_det]:.2f}, predicted by another model. You need to judge with the input image and the above reference information. If the prediction confidence is relatively low, you need to depend on the image.
-            console.print("[bold red]User:[/bold red] " + query)
+            # console.print("[bold red]User:[/bold red] " + query)
             outputs = chat.infer(
                 query = query,
                 images = [image_crop_modified],
             )
-            console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
             captions.append(outputs)
             
             # For the LLava debug folder
@@ -565,7 +565,7 @@ def filter_rigid_objects(args, results, part_results):
             print("Timed out exceeded!")
             output_dict["filter_mask"] = "FAIL"
             output_dict["reason"] = "FAIL"
-            exit(1)
+            # exit(1)
         else:
             try:
                 # Attempt to parse the output as a JSON
@@ -740,12 +740,12 @@ def extract_part_captions(args, results, part_results):
                 If it has a cylinder shape, looks like to pull or rotate, and lies on wooden furniture, door, window, choose 'handle'.
                 Format your answer with the start: 'The item outlined by red is [YOUR CHOICE]. Description: ...' '''
   
-                console.print("[bold red]User:[/bold red] " + query)
+                # console.print("[bold red]User:[/bold red] " + query)
                 outputs = chat.infer(
                     query = query,
                     images = [concat_image],
                 )
-                console.print("[bold green]LLaVA:[/bold green] " + outputs)
+                # console.print("[bold green]LLaVA:[/bold green] " + outputs)
                 captions.append(outputs)
                 
                 # For the LLava debug folder
@@ -886,7 +886,7 @@ def build_rigid_funcgraph(args, results, part_results):
                     output_dict["connection_tag"] = "FAIL"
                     output_dict["function"] = 'FAIL'
                     output_dict["reason"] = 'FAIL'
-                    exit(1)
+                    # exit(1)
                 else:
                     try:
                         # Attempt to parse the output as a JSON
@@ -899,7 +899,7 @@ def build_rigid_funcgraph(args, results, part_results):
                         output_dict["connection_tag"] = "FAIL"
                         output_dict["function"] = 'FAIL'
                         output_dict["reason"] = 'FAIL'
-                        exit(1)
+                        # exit(1)
                 relations.append(output_dict)
 
         # Saving the output
@@ -1043,7 +1043,7 @@ def filter_remote_interactable_objects(args, results):
             output_dict["mask"] = "FAIL"
             output_dict["reason"] = "FAIL"
             print('Failed!')
-            exit(1)
+            # exit(1)
         
         # Saving the output
         print("Saving object masks to file...")
@@ -1120,7 +1120,7 @@ def build_object_funcgraph(args, results, func_edges):
         except:
             output_dict["categories"] = "FAIL"
             output_dict["reason"] = "FAIL"
-            exit(1)
+            # exit(1)
         categories = output_dict["categories"]
         # Saving the output
         print("Saving object categories to file...")
@@ -1196,7 +1196,7 @@ def build_object_funcgraph(args, results, func_edges):
             except:
                 output_dict["object_relation"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                exit(1)
+                # exit(1)
             relations.append(output_dict)
 
         # Saving the output
@@ -1377,12 +1377,12 @@ def prune_graph(args, results, func_edges):
                  in the right image. You should provide your illustration, reason, and the confidence score between 0 to 1.
                  Format your answer with: Illustration: ...  Confidence: ... Reason: ...
             '''
-            console.print("[bold red]User:[/bold red] " + query)
+            # console.print("[bold red]User:[/bold red] " + query)
             outputs = chat.infer(
                 query = query,
                 images = [concat_image],
             )
-            console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
             captions_list.append(outputs)
         
         if not (Path(savedir_debug) / ("prune_graph_" + str(inter_ele_idx) +".json")).exists():
@@ -1433,7 +1433,7 @@ def prune_graph(args, results, func_edges):
             except:
                 output_dict["confidence"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                exit(1)
+                # exit(1)
             # Saving the output
             print("Saving pruning graph to file...")
             with open(Path(savedir_debug) / ("prune_graph_" + str(inter_ele_idx) +".json"), "w") as f:
@@ -1509,12 +1509,12 @@ def prune_graph(args, results, func_edges):
                  in the right image. You should provide your illustration, reason, and the confidence score between 0 to 1.
                  Format your answer with: Illustration: ...  Confidence: ... Reason: ...
             '''
-            console.print("[bold red]User:[/bold red] " + query)
+            # console.print("[bold red]User:[/bold red] " + query)
             outputs = chat.infer(
                 query = query,
                 images = [concat_image],
             )
-            console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
             captions_list.append(outputs)
         
         if not (Path(savedir_debug) / ("prune_graph_" + str(obj_idx) +".json")).exists():
@@ -1563,7 +1563,7 @@ def prune_graph(args, results, func_edges):
             except:
                 output_dict["confidence"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                exit(1)
+                # exit(1)
             # Saving the output
             print("Saving pruning graph to file...")
             with open(Path(savedir_debug) / ("prune_graph_" + str(obj_idx) +".json"), "w") as f:
