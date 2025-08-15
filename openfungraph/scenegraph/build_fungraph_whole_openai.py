@@ -419,71 +419,68 @@ def refine_node_captions(args):
     # Load the captions for each segment
     if not args.part_reg:
         caption_file = Path(args.cachedir) / "cfslam_llava_captions.json"
-    else:
-        caption_file = Path(args.cachedir) / "part_llava_captions.json"
-    captions = None
-    with open(caption_file, "r") as f:
-        captions = json.load(f)
-    
-    # load the prompt
-    gpt_messages = GPTPrompt().get_json()
-
-    TIMEOUT = 60  # Timeout in seconds
-    if not args.part_reg:
         responses_savedir = Path(args.cachedir) / "cfslam_gpt-4_responses"
     else:
+        caption_file = Path(args.cachedir) / "part_llava_captions.json"
         responses_savedir = Path(args.cachedir) / "part_gpt-4_responses"
+
+    with open(caption_file, "r", encoding="utf-8") as f:
+        captions = json.load(f)
+
+    gpt_messages = GPTPrompt().get_json()
     responses_savedir.mkdir(exist_ok=True, parents=True)
 
+    TIMEOUT = 60
     responses = []
-    unsucessful_responses = 0
+    unsuccessful = 0
 
-    # loop over every object
-    for _i in trange(len(captions)):
-        if len(captions[_i]) == 0:
+    for cap in trange(len(captions)):
+        if not captions[cap].get("captions"):
             continue
-        
-        # Prepare the object prompt 
-        _dict = {}
-        _caption = captions[_i]
-        _dict["id"] = _caption["id"]
-        _dict["captions"] = _caption["captions"]
-        
-        # Make and format the full prompt
-        preds = json.dumps(_dict, indent=0)
 
-        start_time = time.time()
-    
-        curr_chat_messages = gpt_messages[:]
-        curr_chat_messages.append({"role": "user", "content": preds})
-        chat_completion = client.completions.create(
-            # model="gpt-3.5-turbo",
-            model="gpt-4",
-            prompt=curr_chat_messages,
-            timeout=TIMEOUT,  # Timeout in seconds
-        )
-        elapsed_time = time.time() - start_time
-        if elapsed_time > TIMEOUT:
-            print("Timed out exceeded!")
-            _dict["response"] = "FAIL"
-            save_json_to_file(_dict, responses_savedir / f"{_caption['id']}.json")
-            responses.append(json.dumps(_dict))
-            unsucessful_responses += 1
-            exit(1)
-        
-        # count unsucessful responses
-        if "invalid" in chat_completion["choices"][0]["message"]["content"].strip("\n"):
-            unsucessful_responses += 1
-            
-        # print output
-        prjson([{"role": "user", "content": preds}])
-        print(chat_completion["choices"][0]["message"]["content"])
-        print(f"Unsucessful responses so far: {unsucessful_responses}")
-        _dict["response"] = chat_completion["choices"][0]["message"]["content"].strip("\n")
-        
-        # save the response
+        obj_id = captions[cap]["id"]
+        preds = json.dumps({
+            "id": obj_id,
+            "captions": captions[cap]["captions"]
+        }, indent=0)
+
+        # helper to call a given model
+        def call_model(model_name):
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=gpt_messages + [{"role": "user", "content": preds}],
+                    timeout=TIMEOUT
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"[ERROR] GPT call ({model_name}): {e}")
+                return None
+
+        # First try with gpt-4o-mini
+        content = call_model("gpt-4o-mini")
+        fallback_used = False
+
+        # Check if fallback needed
+        if not content or "invalid" in content.lower():
+            fallback_used = True
+            content = call_model("gpt-5-mini")
+
+        if not content:
+            unsuccessful += 1
+            content = "FAIL"
+
+        if "invalid" in content.lower():
+            unsuccessful += 1
+
+        print(f"Object {obj_id} ({'fallback' if fallback_used else 'primary'}): {content}")
+        _dict = {
+            "id": obj_id,
+            "captions": captions[cap]["captions"],
+            "response": content
+        }
+        save_json_to_file(_dict, responses_savedir / f"{obj_id}.json")
         responses.append(json.dumps(_dict))
-        save_json_to_file(_dict, responses_savedir / f"{_caption['id']}.json")
 
     if not args.part_reg:
         with open(Path(args.cachedir) / "cfslam_gpt-4_responses.pkl", "wb") as f:
@@ -492,6 +489,7 @@ def refine_node_captions(args):
         with open(Path(args.cachedir) / "part_gpt-4_responses.pkl", "wb") as f:
             pkl.dump(responses, f)
 
+    print(f"Unsuccessful responses: {unsuccessful}")
 
 def filter_rigid_objects(args, results, part_results):
     obj_cand = results['inter_id_candidate']
@@ -503,31 +501,34 @@ def filter_rigid_objects(args, results, part_results):
     response_dir = Path(args.cachedir) / "cfslam_gpt-4_responses"
     responses = []
     object_tags = []
-    also_indices_to_remove = [] # indices to remove if the json file does not exist
+    kept_ids = []  # <-- track which obj_cand actually had a JSON
+
     for idx in obj_cand:
-        # check if the json file exists first 
-        if not (response_dir / f"{idx}.json").exists():
-            also_indices_to_remove.append(idx)
+        json_path = response_dir / f"{idx}.json"
+        if not json_path.exists():
             continue
-        with open(response_dir / f"{idx}.json", "r") as f:
+        with open(json_path, "r", encoding="utf-8") as f:
             _d = json.load(f)
             try:
                 _d["response"] = json.loads(_d["response"])
             except json.JSONDecodeError:
                 _d["response"] = {
-                    'summary': f'GPT4 json reply failed: Here is the invalid response {_d["response"]}',
-                    'possible_tags': ['possible_tag_json_failed'],
-                    'object_tag': 'invalid'
+                    "summary": f'GPT json reply failed: invalid response {_d.get("response")}',
+                    "possible_tags": ["possible_tag_json_failed"],
+                    "object_tag": "invalid",
                 }
             responses.append(_d)
             object_tags.append(_d["response"]["object_tag"])
+            kept_ids.append(idx)
+
+    # light normalization of tags for the next prompt
     for i, tag in enumerate(object_tags):
-        if ' with ' in tag:
-            object_tags[i] = tag.split(' with ')[0]
-        elif ' on ' in tag:
-            object_tags[i] = tag.split(' on ')[-1]
-        elif ' and ' in tag:
-            object_tags[i] = tag.split(' and ')[0]
+        if " with " in tag:
+            object_tags[i] = tag.split(" with ")[0]
+        elif " on " in tag:
+            object_tags[i] = tag.split(" on ")[-1]
+        elif " and " in tag:
+            object_tags[i] = tag.split(" and ")[0]
     
     if not (Path(args.cachedir) / "rigid_interactable_object_mask.json").exists():
         TIMEOUT = 25
@@ -549,10 +550,12 @@ def filter_rigid_objects(args, results, part_results):
         """
 
         start_time = time.time()
-        chat_completion = client.completions.create(
+        chat_completion = client.chat.completions.create(
             # model="gpt-3.5-turbo",
-            model="gpt-4",
-            prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
+            # model="gpt-4",
+            model="gpt-4o-mini",
+            # model="gpt-5-mini",
+            messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
             timeout=60,  # Timeout in seconds
         )
         elapsed_time = time.time() - start_time
@@ -566,7 +569,7 @@ def filter_rigid_objects(args, results, part_results):
         else:
             try:
                 # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+                chat_output_json = json.loads(chat_completion.choices[0].message.content)
                 # If the output is a valid JSON, then add it to the output dictionary
                 output_dict["filter_mask"] = chat_output_json["filter_mask"]
                 output_dict["reason"] = chat_output_json["reason"]
@@ -583,10 +586,19 @@ def filter_rigid_objects(args, results, part_results):
     
     filter_mask = output_dict["filter_mask"]
     rigid_inter_id_candidate = []
-    for i in range(len(filter_mask)):
-        if filter_mask[i]:
-            rigid_inter_id_candidate.append(obj_cand[i])
-            scene_map[obj_cand[i]]['refined_obj_tag'] = object_tags[i]
+    if isinstance(filter_mask, list):
+        min_len = min(len(filter_mask), len(kept_ids))
+        if len(filter_mask) != len(kept_ids):
+            print(f"[WARN] filter_mask len {len(filter_mask)} != kept_ids len {len(kept_ids)}; using first {min_len} items.")
+        for i in range(min_len):
+            if filter_mask[i]:
+                obj_id = kept_ids[i]                 # <-- aligned id
+                rigid_inter_id_candidate.append(obj_id)
+                # object_tags[i] aligns to kept_ids[i]
+                scene_map[obj_id]['refined_obj_tag'] = object_tags[i]
+    else:
+        print("[ERROR] filter_mask is not a list; skipping rigid selection.")
+
     # parts
     part_inter_id_candidate = []
     for idx in obj_cand:
@@ -859,10 +871,12 @@ def build_rigid_funcgraph(args, results, part_results):
                 """
                 # Note that if you meet with object tags like television stand and entertainment center, knob and handles are likely for pulling drawers on them.
                 start_time = time.time()
-                chat_completion = client.completions.create(
+                chat_completion = client.chat.completions.create(
                     # model="gpt-3.5-turbo",
-                    model="gpt-4",
-                    prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
+                    # model="gpt-4",
+                    model="gpt-4o-mini",
+                    # model="gpt-5-mini",
+                    messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
                     timeout=TIMEOUT,  # Timeout in seconds
                 )
                 elapsed_time = time.time() - start_time
@@ -876,7 +890,7 @@ def build_rigid_funcgraph(args, results, part_results):
                 else:
                     try:
                         # Attempt to parse the output as a JSON
-                        chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+                        chat_output_json = json.loads(chat_completion.choices[0].message.content)
                         # If the output is a valid JSON, then add it to the output dictionary
                         output_dict["connection_tag"] = chat_output_json["connection_tag"]
                         output_dict["function"] = chat_output_json["function"]
@@ -1009,17 +1023,19 @@ def filter_remote_interactable_objects(args, results):
             In the key 'reason', illustrate the cooresponding reasons of each choice.
         """
 
-        chat_completion = client.completions.create(
+        chat_completion = client.chat.completions.create(
             # model="gpt-3.5-turbo",
-            model="gpt-4",
-            prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
+            # model="gpt-4",
+            model="gpt-4o-mini",
+            # model="gpt-5-mini",
+            messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
             timeout=60,  # Timeout in seconds
         )
         output_dict = {'id': pruned_id_list}
         output_dict['object_tags'] = object_tags
         try:
             # Attempt to parse the output as a JSON
-            chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+            chat_output_json = json.loads(chat_completion.choices[0].message.content)
             # If the output is a valid JSON, then add it to the output dictionary
             output_dict["mask"] = chat_output_json["mask"]
             output_dict["reason"] = chat_output_json["reason"]
@@ -1086,16 +1102,18 @@ def build_object_funcgraph(args, results, func_edges):
         "reason" is a list of the reason why you choose the categories.
         """
 
-        chat_completion = client.completions.create(
+        chat_completion = client.chat.completions.create(
             # model="gpt-3.5-turbo",
-            model="gpt-4",
-            prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
+            # model="gpt-4",
+            model="gpt-4o-mini",
+            # model="gpt-5-mini",
+            messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
             timeout=60,  # Timeout in seconds
         )
         output_dict = input_dict
         try:
             # Attempt to parse the output as a JSON
-            chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+            chat_output_json = json.loads(chat_completion.choices[0].message.content)
             # If the output is a valid JSON, then add it to the output dictionary
             output_dict["categories"] = chat_output_json["categories"]
             output_dict["reason"] = chat_output_json["reason"]
@@ -1160,16 +1178,18 @@ def build_object_funcgraph(args, results, func_edges):
             It also should be a list with the same length of "objects".
             """
 
-            chat_completion = client.completions.create(
+            chat_completion = client.chat.completions.create(
                 # model="gpt-3.5-turbo",
-                model="gpt-4",
-                prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
+                # model="gpt-4",
+                model="gpt-4o-mini",
+                # model="gpt-5-mini",
+                messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
                 timeout=60,  # Timeout in seconds
             )
             output_dict = input_dict
             try:
                 # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+                chat_output_json = json.loads(chat_completion.choices[0].message.content)
                 # If the output is a valid JSON, then add it to the output dictionary
                 output_dict["object_relation"] = chat_output_json["object_relation"]
                 output_dict["reason"] = chat_output_json["reason"]
@@ -1395,16 +1415,18 @@ def prune_graph(args, results, func_edges):
                 "reason": the list of reasons why you make the judgment, with the same length as 'confidence'.
             """
 
-            chat_completion = client.completions.create(
+            chat_completion = client.chat.completions.create(
                 # model="gpt-3.5-turbo",
-                model="gpt-4",
-                prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
+                # model="gpt-4",
+                model="gpt-4o-mini",
+                # model="gpt-5-mini",
+                messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
                 timeout=60,  # Timeout in seconds
             )
             output_dict = input_dict
             try:
                 # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+                chat_output_json = json.loads(chat_completion.choices[0].message.content)
                 # If the output is a valid JSON, then add it to the output dictionary
                 output_dict["confidence"] = chat_output_json["confidence"]
                 output_dict["reason"] = chat_output_json["reason"]
@@ -1522,17 +1544,19 @@ def prune_graph(args, results, func_edges):
                 "reason": the list of reasons why you make the judgement, with the same length as 'confidence'.
             """
 
-            chat_completion = client.completions.create(
+            chat_completion = client.chat.completions.create(
                 # model="gpt-3.5-turbo",
-                model="gpt-4",
-                prompt=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
+                # model="gpt-4",
+                model="gpt-4o-mini",
+                # model="gpt-5-mini",
+                messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
                 timeout=60,  # Timeout in seconds
             )
 
             output_dict = input_dict
             try:
                 # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion["choices"][0]["message"]["content"])
+                chat_output_json = json.loads(chat_completion.choices[0].message.content)
                 # If the output is a valid JSON, then add it to the output dictionary
                 output_dict["confidence"] = chat_output_json["confidence"]
                 output_dict["reason"] = chat_output_json["reason"]
