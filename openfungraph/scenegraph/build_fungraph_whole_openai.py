@@ -60,6 +60,53 @@ import requests
 openai.api_key = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai.api_key)
 
+TIMEOUT = 60  # Default timeout for OpenAI API calls
+
+# ---------------------------
+# Shared GPT chat helper
+# ---------------------------
+def gpt_complete_with_fallback(
+    messages,
+    timeout: int = 60,
+    primary_model: str = "gpt-4o-mini",
+    secondary_model: str = "gpt-5-mini",
+):
+    """
+    Call OpenAI chat with a primary lightweight model, then fall back to a stronger model
+    if the primary fails or returns an invalid-looking response.
+
+    Returns:
+        content (str | None): assistant message content, or None if both attempts fail.
+    """
+    def _call(model_name: str):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                timeout=timeout,
+            )
+            content = resp.choices[0].message.content
+            return (content.strip() if content else None)
+        except Exception as e:
+            logger.error(f"[ERROR] GPT call ({model_name}): {e}")
+            return None
+
+    # Try primary
+    content = _call(primary_model)
+    # Heuristic consistency with your existing check
+    needs_fallback = (not content) or ("invalid" in content.lower())
+
+    if needs_fallback:
+        fb_content = _call(secondary_model)
+        if fb_content:
+            logger.info(f"[INFO] Fallback model used: {secondary_model}")
+            return fb_content
+        # if fallback also failed, keep original (likely None) for downstream handling
+    else:
+        logger.info(f"[INFO] Primary model used: {primary_model}")
+
+    return content
+
 
 @dataclass
 class ProgramArgs:
