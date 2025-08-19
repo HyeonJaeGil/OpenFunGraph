@@ -154,7 +154,7 @@ def get_classes_colors(classes):
     return class_colors
 
 
-def load_scene_map_results(loaded_data, scene_map):
+def load_scene_map_results(loaded_data, scene_map: MapObjectList):
     # Check the type of the loaded data to decide how to proceed
     if isinstance(loaded_data, dict) and "objects" in loaded_data:
         scene_map.load_serializable(loaded_data["objects"])
@@ -317,8 +317,20 @@ def save_json_to_file(json_str, filename):
         json.dump(json_str, f, indent=4, sort_keys=False)
 
 
+def clean_json_string(s: str) -> str:
+    """Remove Markdown code fences if present."""
+    s = s.strip()
+    if s.startswith("```"):
+        # Remove leading ```json or ```
+        s = s.split("\n", 1)[1] if "\n" in s else s
+        # Remove trailing ```
+        if s.endswith("```"):
+            s = s.rsplit("```", 1)[0]
+    return s.strip()
+
+
 def extract_node_captions(args, results):
-    
+    logger.debug("Extracting node captions...")
     meta_file = os.path.join(args.dataset_root, 'metadata.csv')
     if os.path.exists(meta_file):
         with open(meta_file, encoding = 'utf-8') as f:
@@ -331,10 +343,14 @@ def extract_node_captions(args, results):
 
     console = rich.console.Console()
 
+    if (Path(args.cachedir) / "cfslam_llava_captions.json").exists():
+        logger.info("LLaVA captions already exist, skipping extraction.")
+        return
+
     scene_map = MapObjectList()
     load_scene_map_results(results, scene_map)
     obj_cand = results['inter_id_candidate']
-    print('Total Objects with rigid interaction: ', len(obj_cand))
+    logger.info(f'Total Objects with rigid interaction: {len(obj_cand)}')
 
     chat = LlavaModel16(
         model_path = args.llava_model_path,
@@ -385,7 +401,7 @@ def extract_node_captions(args, results):
         mask_list = []  # New list for masks
         
         num = 0
-        for idx_det in tqdm(idx_most_conf):
+        for idx_det in idx_most_conf:
             image = Image.open(obj["color_path"][idx_det]).convert("RGB")
             if camera_axis == 'Left':
                 image = image.rotate(-90, expand=True)
@@ -434,12 +450,12 @@ def extract_node_captions(args, results):
                 else:
                     query = "Describe the main object in the image."
                 # It might be a " + class_name + ", with confidence of " + f"{obj['conf'][idx_det]:.2f}, predicted by another model. You need to judge with the input image and the above reference information. If the prediction confidence is relatively low, you need to depend on the image.
-            # console.print("[bold red]User:[/bold red] " + query)
+            logger.debug("User: " + query)
             outputs = chat.infer(
                 query = query,
                 images = [image_crop_modified],
             )
-            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            logger.debug("LLaVA: " + outputs)    # bold green
             captions.append(outputs)
             
             # For the LLava debug folder
@@ -486,6 +502,7 @@ def extract_node_captions(args, results):
     chat.delete()
 
 def refine_node_captions(args):
+    logger.debug("Refining node captions...")
     # Load the captions for each segment
     if not args.part_reg:
         caption_file = Path(args.cachedir) / "cfslam_llava_captions.json"
@@ -494,16 +511,24 @@ def refine_node_captions(args):
         caption_file = Path(args.cachedir) / "part_llava_captions.json"
         responses_savedir = Path(args.cachedir) / "part_gpt-4_responses"
 
+    if not args.part_reg and (Path(args.cachedir) / "cfslam_gpt-4_responses.pkl").exists():
+        logger.info("GPT-4 responses already exist, skipping extraction.")
+        return
+    
+    if args.part_reg and (Path(args.cachedir) / "part_gpt-4_responses.pkl").exists():
+        logger.info("Part GPT-4 responses already exist, skipping extraction.")
+        return
+
     with open(caption_file, "r", encoding="utf-8") as f:
         captions = json.load(f)
 
     gpt_messages = GPTPrompt().get_json()
     responses_savedir.mkdir(exist_ok=True, parents=True)
 
-    TIMEOUT = 60
     responses = []
     unsuccessful = 0
 
+    logger.debug(f"Total objects to process: {len(captions)}")
     for cap in trange(len(captions)):
         if not captions[cap].get("captions"):
             continue
@@ -514,36 +539,24 @@ def refine_node_captions(args):
             "captions": captions[cap]["captions"]
         }, indent=0)
 
-        # helper to call a given model
-        def call_model(model_name):
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=gpt_messages + [{"role": "user", "content": preds}],
-                    timeout=TIMEOUT
-                )
-                return resp.choices[0].message.content.strip()
-            except Exception as e:
-                print(f"[ERROR] GPT call ({model_name}): {e}")
-                return None
+        # Use shared helper (primary then fallback)
+        content = gpt_complete_with_fallback(
+            messages=gpt_messages + [{"role": "user", "content": preds}],
+            timeout=TIMEOUT,
+            primary_model="gpt-4o-mini",
+            secondary_model="gpt-5-mini",
+        )
+        content = clean_json_string(content)
+        logger.debug(f"GPT response content for object {obj_id}: {content}")
 
-        # First try with gpt-4o-mini
-        content = call_model("gpt-4o-mini")
-        fallback_used = False
-
-        # Check if fallback needed
-        if not content or "invalid" in content.lower():
-            fallback_used = True
-            content = call_model("gpt-5-mini")
 
         if not content:
             unsuccessful += 1
             content = "FAIL"
-
-        if "invalid" in content.lower():
+        elif "invalid" in content.lower():
             unsuccessful += 1
 
-        print(f"Object {obj_id} ({'fallback' if fallback_used else 'primary'}): {content}")
+        logger.info(f"Object {obj_id}: {content}")
         _dict = {
             "id": obj_id,
             "captions": captions[cap]["captions"],
@@ -559,9 +572,10 @@ def refine_node_captions(args):
         with open(Path(args.cachedir) / "part_gpt-4_responses.pkl", "wb") as f:
             pkl.dump(responses, f)
 
-    print(f"Unsuccessful responses: {unsuccessful}")
+    logger.info(f"Unsuccessful responses: {unsuccessful}")
 
 def filter_rigid_objects(args, results, part_results):
+    logger.debug("Filtering rigid objects...")
     obj_cand = results['inter_id_candidate']
     scene_map = MapObjectList()
     load_scene_map_results(results, scene_map)
@@ -601,7 +615,7 @@ def filter_rigid_objects(args, results, part_results):
             object_tags[i] = tag.split(" and ")[0]
     
     if not (Path(args.cachedir) / "rigid_interactable_object_mask.json").exists():
-        TIMEOUT = 25
+        logger.info("No existing object masks found, querying GPT for new masks...")
         DEFAULT_PROMPT = """
             Below is a list containing some predicted specific object tags of furnitures in the same room. 
             You should select which furnitures belong to categories of something having space for storage: drawer, cabinet, kitchen countertop, dresser, wardrobe, nightstand, TV stand, trashcan;
@@ -620,54 +634,64 @@ def filter_rigid_objects(args, results, part_results):
         """
 
         start_time = time.time()
-        chat_completion = client.chat.completions.create(
-            # model="gpt-3.5-turbo",
-            # model="gpt-4",
-            model="gpt-4o-mini",
-            # model="gpt-5-mini",
+        content = gpt_complete_with_fallback(
             messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
-            timeout=60,  # Timeout in seconds
+            timeout=TIMEOUT,
+            primary_model="gpt-4o-mini",
+            secondary_model="gpt-5-mini",
         )
         elapsed_time = time.time() - start_time
         output_dict = {}
         output_dict['object_tags'] = object_tags
-        if elapsed_time > TIMEOUT:
-            print("Timed out exceeded!")
+        if elapsed_time > TIMEOUT*2 or not content:
             output_dict["filter_mask"] = "FAIL"
             output_dict["reason"] = "FAIL"
-            # exit(1)
+            logger.warning(f"[ERROR] GPT response took too long ({elapsed_time:.2f}s) or returned no content.")
+            exit(1)
         else:
             try:
-                # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion.choices[0].message.content)
-                # If the output is a valid JSON, then add it to the output dictionary
+                content = clean_json_string(content)
+                logger.debug(f"GPT response content: {content}")
+                chat_output_json = json.loads(content)
                 output_dict["filter_mask"] = chat_output_json["filter_mask"]
                 output_dict["reason"] = chat_output_json["reason"]
             except:
                 output_dict["filter_mask"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-        
+                logger.warning(f"[ERROR] GPT response parsing failed")
+                exit(1)
+
         # Saving the output
-        print("Saving object masks to file...")
+        logger.info("Saving object masks to file...")
         with open(Path(args.cachedir) / "rigid_interactable_object_mask.json", "w") as f:
             json.dump(output_dict, f, indent=4)
     else:
+        logger.info("Loading existing object masks from file...")
         output_dict = json.load(open(Path(args.cachedir) / "rigid_interactable_object_mask.json", "r"))
     
+    # filter_mask = output_dict["filter_mask"]
+    # rigid_inter_id_candidate = []
+    # if isinstance(filter_mask, list):
+    #     min_len = min(len(filter_mask), len(kept_ids))
+    #     if len(filter_mask) != len(kept_ids):
+    #         logger.warning(f"[WARN] filter_mask len {len(filter_mask)} != kept_ids len {len(kept_ids)}; using first {min_len} items.")
+    #     for i in range(min_len):
+    #         if filter_mask[i]:
+    #             obj_id = kept_ids[i]                 # <-- aligned id
+    #             rigid_inter_id_candidate.append(obj_id)
+    #             # object_tags[i] aligns to kept_ids[i]
+    #             scene_map[obj_id]['refined_obj_tag'] = object_tags[i]
+    # else:
+    #     logger.warning("[ERROR] filter_mask is not a list; skipping rigid selection.")
+
+    logger.debug(f"filter_mask: {output_dict['filter_mask']}, length: {len(output_dict['filter_mask'])}")
+    logger.debug(f"object_tags: {obj_cand}, length: {len(obj_cand)}")
     filter_mask = output_dict["filter_mask"]
     rigid_inter_id_candidate = []
-    if isinstance(filter_mask, list):
-        min_len = min(len(filter_mask), len(kept_ids))
-        if len(filter_mask) != len(kept_ids):
-            print(f"[WARN] filter_mask len {len(filter_mask)} != kept_ids len {len(kept_ids)}; using first {min_len} items.")
-        for i in range(min_len):
-            if filter_mask[i]:
-                obj_id = kept_ids[i]                 # <-- aligned id
-                rigid_inter_id_candidate.append(obj_id)
-                # object_tags[i] aligns to kept_ids[i]
-                scene_map[obj_id]['refined_obj_tag'] = object_tags[i]
-    else:
-        print("[ERROR] filter_mask is not a list; skipping rigid selection.")
+    for i in range(len(filter_mask)):
+        if filter_mask[i]:
+            rigid_inter_id_candidate.append(obj_cand[i])
+            scene_map[obj_cand[i]]['refined_obj_tag'] = object_tags[i]
 
     # parts
     part_inter_id_candidate = []
@@ -699,7 +723,7 @@ def filter_rigid_objects(args, results, part_results):
 
 
 def extract_part_captions(args, results, part_results):
-    
+    logger.debug("Extracting part captions...")
     meta_file = os.path.join(args.dataset_root, 'metadata.csv')
     if os.path.exists(meta_file):
         with open(meta_file, encoding = 'utf-8') as f:
@@ -709,6 +733,10 @@ def extract_part_captions(args, results, part_results):
                 camera_axis = line[2]
     else:
         camera_axis = 'Up'
+
+    if (Path(args.cachedir) / "part_llava_captions.json").exists():
+        logger.info("LLaVA captions already exist, skipping extraction.")
+        return
 
     obj_cand = results['inter_id_candidate']
     scene_map = MapObjectList()
@@ -754,7 +782,8 @@ def extract_part_captions(args, results, part_results):
             mask_list = []  # New list for masks
             
             num = 0
-            for idx_det in tqdm(idx_most_conf):
+            # for idx_det in tqdm(idx_most_conf):
+            for idx_det in idx_most_conf:
                 image = Image.open(part["color_path"][idx_det]).convert("RGB")
                 if camera_axis == 'Left':
                     image = image.rotate(-90, expand=True)
@@ -810,12 +839,12 @@ def extract_part_captions(args, results, part_results):
                 If it has a cylinder shape, looks like to pull or rotate, and lies on wooden furniture, door, window, choose 'handle'.
                 Format your answer with the start: 'The item outlined by red is [YOUR CHOICE]. Description: ...' '''
   
-                # console.print("[bold red]User:[/bold red] " + query)
+                logger.debug("User: " + query)
                 outputs = chat.infer(
                     query = query,
                     images = [concat_image],
                 )
-                # console.print("[bold green]LLaVA:[/bold green] " + outputs)
+                logger.debug("LLaVA: " + outputs)    # bold green
                 captions.append(outputs)
                 
                 # For the LLava debug folder
@@ -854,7 +883,7 @@ def extract_part_captions(args, results, part_results):
     chat.delete()
 
 def build_rigid_funcgraph(args, results, part_results):
-
+    logger.debug("Building rigid functional graph...")
     obj_cand = results['inter_id_candidate']
     part_cand = part_results['part_inter_id_candidate']
     scene_map = MapObjectList()
@@ -886,9 +915,9 @@ def build_rigid_funcgraph(args, results, part_results):
             part_summarys[_d["id"]] = _d["response"]["summary"]
             part_tags[_d["id"]] = _d["response"]["object_tag"]
 
-    TIMEOUT = 60  # timeout in seconds
     relations = []
     if not (Path(args.cachedir) / "cfslam_object_rigid_relations.json").exists():
+        logger.info("No existing object relations found, querying GPT for new relations...")
         # pruning using GPT-4 and ensuring the functional edges
         for i in obj_cand:
             obj = scene_map[i]
@@ -904,7 +933,7 @@ def build_rigid_funcgraph(args, results, part_results):
                     }
                 }
            
-                print(f"{input_dict['object']['tag']}, {input_dict['part']['tag']}")
+                logger.info(f"{input_dict['object']['tag']}, {input_dict['part']['tag']}")
 
                 input_json_str = json.dumps(input_dict)
 
@@ -941,42 +970,41 @@ def build_rigid_funcgraph(args, results, part_results):
                 """
                 # Note that if you meet with object tags like television stand and entertainment center, knob and handles are likely for pulling drawers on them.
                 start_time = time.time()
-                chat_completion = client.chat.completions.create(
-                    # model="gpt-3.5-turbo",
-                    # model="gpt-4",
-                    model="gpt-4o-mini",
-                    # model="gpt-5-mini",
+                content = gpt_complete_with_fallback(
                     messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
-                    timeout=TIMEOUT,  # Timeout in seconds
+                    timeout=TIMEOUT,
+                    primary_model="gpt-4o-mini",
+                    secondary_model="gpt-5-mini",
                 )
                 elapsed_time = time.time() - start_time
                 output_dict = input_dict
-                if elapsed_time > TIMEOUT:
-                    print("Timed out exceeded!")
+                if elapsed_time > TIMEOUT*2 or not content:
+                    logger.warning(f"Timed out exceeded or no content {content}")
                     output_dict["connection_tag"] = "FAIL"
                     output_dict["function"] = 'FAIL'
                     output_dict["reason"] = 'FAIL'
-                    # exit(1)
+                    exit(1)
                 else:
                     try:
-                        # Attempt to parse the output as a JSON
-                        chat_output_json = json.loads(chat_completion.choices[0].message.content)
-                        # If the output is a valid JSON, then add it to the output dictionary
+                        content = clean_json_string(content)
+                        chat_output_json = json.loads(content)
                         output_dict["connection_tag"] = chat_output_json["connection_tag"]
                         output_dict["function"] = chat_output_json["function"]
                         output_dict["reason"] = chat_output_json["reason"]
                     except:
+                        logger.warning(f"GPT response parsing failed: {content}")
                         output_dict["connection_tag"] = "FAIL"
                         output_dict["function"] = 'FAIL'
                         output_dict["reason"] = 'FAIL'
-                        # exit(1)
+                        exit(1)
                 relations.append(output_dict)
 
         # Saving the output
-        print("Saving object relations to file...")
+        logger.info("Saving object relations to file...")
         with open(Path(args.cachedir) / "cfslam_object_rigid_relations.json", "w") as f:
             json.dump(relations, f, indent=4)
     else:
+        logger.info("Loading existing object relations from file...")
         relations = json.load(open(Path(args.cachedir) / "cfslam_object_rigid_relations.json", "r"))
 
     scenegraph_edges = []
@@ -1005,11 +1033,11 @@ def build_rigid_funcgraph(args, results, part_results):
         'part_inter_id_candidate': list(set(new_part_cand))
     }   
 
-    save_path = args.part_file
+    save_path = args.part_file.replace('.pkl.gz', '_updated_rigid.pkl.gz')
     
     with gzip.open(save_path, "wb") as f:
         pkl.dump(updated_part_results, f)
-    print(f"Saved full point cloud to {save_path}") 
+    logger.info(f"Saved full point cloud to {save_path}") 
 
     updated_results = {
         'objects': scene_map.to_serializable(),
@@ -1019,11 +1047,11 @@ def build_rigid_funcgraph(args, results, part_results):
         'inter_id_candidate': list(set(obj_cand))
     }    
 
-    save_path = args.mapfile
+    save_path = args.mapfile.replace('.pkl.gz', '_updated_rigid.pkl.gz')
     
     with gzip.open(save_path, "wb") as f:
         pkl.dump(updated_results, f)
-    print(f"Saved full point cloud to {save_path}")
+    logger.info(f"Saved full point cloud to {save_path}")
 
     scenegraph_edges = list(set(scenegraph_edges))
 
@@ -1034,6 +1062,7 @@ def build_rigid_funcgraph(args, results, part_results):
 
 
 def filter_remote_interactable_objects(args, results):
+    logger.debug("Filtering remote interactable objects...")
     scene_map = MapObjectList()
     load_scene_map_results(results, scene_map)
     obj_cand = results['inter_id_candidate']
@@ -1064,7 +1093,7 @@ def filter_remote_interactable_objects(args, results):
     indices_to_remove = list(set(indices_to_remove))
     # List of tags in original scene map that are in the pruned scene map
     segment_ids_to_retain = [i for i in range(len(responses)) if i not in indices_to_remove]
-    print(f"Removed {len(indices_to_remove)} segments")
+    logger.info(f"Removed {len(indices_to_remove)} segments")
     # Filtering responses based on segment_ids_to_retain
     responses = [responses[i] for i in range(len(responses)) if i in segment_ids_to_retain]
     # Assuming each response dictionary contains an 'object_tag' key for the object tag.
@@ -1081,7 +1110,7 @@ def filter_remote_interactable_objects(args, results):
             object_tags[i] = tag.split(' and ')[0]
     
     if not (Path(args.cachedir) / "interactable_object_mask.json").exists():
-
+        logger.info("No existing object masks found, querying GPT for new masks...")
         DEFAULT_PROMPT = """
             Below is a list containing some predicted object tags of household objects in the same room. 
             As a specialist agent analysing functional connections among different objects, you need to determine which objects could be operated remotely (e.g. TV, air conditioner, oven, refrigerator, ceiling light) or could operate other items remotely (e.g. remote control, switch, electric outlet).
@@ -1093,33 +1122,33 @@ def filter_remote_interactable_objects(args, results):
             In the key 'reason', illustrate the cooresponding reasons of each choice.
         """
 
-        chat_completion = client.chat.completions.create(
-            # model="gpt-3.5-turbo",
-            # model="gpt-4",
-            model="gpt-4o-mini",
-            # model="gpt-5-mini",
+        content = gpt_complete_with_fallback(
             messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + json.dumps(object_tags)}],
-            timeout=60,  # Timeout in seconds
+            timeout=TIMEOUT,
+            primary_model="gpt-5-mini",
+            secondary_model="gpt-5-mini",
         )
+        content = clean_json_string(content)
+        logger.debug(f"GPT response content: {content}")
         output_dict = {'id': pruned_id_list}
         output_dict['object_tags'] = object_tags
         try:
-            # Attempt to parse the output as a JSON
-            chat_output_json = json.loads(chat_completion.choices[0].message.content)
-            # If the output is a valid JSON, then add it to the output dictionary
+            content = clean_json_string(content)
+            chat_output_json = json.loads(content) if content else None
             output_dict["mask"] = chat_output_json["mask"]
             output_dict["reason"] = chat_output_json["reason"]
         except:
             output_dict["mask"] = "FAIL"
             output_dict["reason"] = "FAIL"
-            print('Failed!')
-            # exit(1)
+            logger.warning(f"[ERROR] Interactive object mask failed to parse or no content returned")
+            exit(1)
         
         # Saving the output
-        print("Saving object masks to file...")
+        logger.info("Saving object masks to file...")
         with open(Path(args.cachedir) / "interactable_object_mask.json", "w") as f:
             json.dump(output_dict, f, indent=4)
     else:
+        logger.info("Loading existing object masks from file...")
         output_dict = json.load(open(Path(args.cachedir) / "interactable_object_mask.json", "r"))
     
     for i in range(len(output_dict["mask"])):
@@ -1136,16 +1165,19 @@ def filter_remote_interactable_objects(args, results):
         'inter_id_candidate': list(set(obj_cand))
     }    
 
-    save_path = Path(args.mapfile)
+    # save_path = Path(args.mapfile)
+    save_path = args.mapfile.replace('.pkl.gz', '_updated_remote.pkl.gz')
+
     
     with gzip.open(save_path, "wb") as f:
         pkl.dump(updated_results, f)
-    print(f"Saved full point cloud to {save_path}")
+    logger.info(f"Saved full point cloud to {save_path}")
 
     return updated_results
 
 
 def build_object_funcgraph(args, results, func_edges):
+    logger.debug("Building object functional graph...")
     obj_cand = results['inter_id_candidate']
     scene_map = MapObjectList()
     load_scene_map_results(results, scene_map)
@@ -1156,7 +1188,7 @@ def build_object_funcgraph(args, results, func_edges):
 
     categories = []
     if not (Path(args.cachedir) / "functional_object_categories.json").exists():
-        
+        logger.info("No existing object categories found, querying GPT for new categories...")
         input_dict = {"objects": obj_tags,}
 
         input_json_str = json.dumps(input_dict)
@@ -1172,35 +1204,36 @@ def build_object_funcgraph(args, results, func_edges):
         "reason" is a list of the reason why you choose the categories.
         """
 
-        chat_completion = client.chat.completions.create(
-            # model="gpt-3.5-turbo",
-            # model="gpt-4",
-            model="gpt-4o-mini",
-            # model="gpt-5-mini",
+        content = gpt_complete_with_fallback(
             messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
-            timeout=60,  # Timeout in seconds
+            timeout=TIMEOUT,
+            primary_model="gpt-4o-mini",
+            secondary_model="gpt-5-mini",
         )
+        content = clean_json_string(content)
+        logger.debug(f"GPT response content: {content}")
         output_dict = input_dict
         try:
-            # Attempt to parse the output as a JSON
-            chat_output_json = json.loads(chat_completion.choices[0].message.content)
-            # If the output is a valid JSON, then add it to the output dictionary
+            chat_output_json = json.loads(content) if content else None
             output_dict["categories"] = chat_output_json["categories"]
             output_dict["reason"] = chat_output_json["reason"]
         except:
             output_dict["categories"] = "FAIL"
             output_dict["reason"] = "FAIL"
-            # exit(1)
+            logger.warning(f"[ERROR] functional object categories failed to parse or no content returned")
+            exit(1)
         categories = output_dict["categories"]
         # Saving the output
-        print("Saving object categories to file...")
+        logger.info("Saving object categories to file...")
         with open(Path(args.cachedir) / "functional_object_categories.json", "w") as f:
             json.dump(output_dict, f, indent=4)
     else:
+        logger.info("Loading existing object categories from file...")
         categories = json.load(open(Path(args.cachedir) / "functional_object_categories.json", "r"))["categories"]
 
     relations = []
     if not (Path(args.cachedir) / "cfslam_object_relations.json").exists():
+        logger.info("No existing object relations found, querying GPT for new relations...")
         for i, idx1 in enumerate(obj_cand):
             # only for interactable elements
             if 'other' in categories[i]:
@@ -1224,7 +1257,7 @@ def build_object_funcgraph(args, results, func_edges):
                     "id": idx2,
                     "tag": obj2['refined_obj_tag'],
                 })
-            print(input_dict["interactable element"]["tag"])
+            logger.info(input_dict["interactable element"]["tag"])
             if len(input_dict["objects"]) == 0:
                 continue
             input_json_str = json.dumps(input_dict)
@@ -1248,32 +1281,34 @@ def build_object_funcgraph(args, results, func_edges):
             It also should be a list with the same length of "objects".
             """
 
-            chat_completion = client.chat.completions.create(
-                # model="gpt-3.5-turbo",
-                # model="gpt-4",
-                model="gpt-4o-mini",
-                # model="gpt-5-mini",
+            content = gpt_complete_with_fallback(
                 messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
-                timeout=60,  # Timeout in seconds
+                timeout=TIMEOUT,
+                primary_model="gpt-4o-mini",
+                secondary_model="gpt-5-mini",
             )
+            content = clean_json_string(content)
+            logger.debug(f"GPT response content: {content}")
             output_dict = input_dict
             try:
-                # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion.choices[0].message.content)
-                # If the output is a valid JSON, then add it to the output dictionary
-                output_dict["object_relation"] = chat_output_json["object_relation"]
+                chat_output_json = json.loads(content) if content else None
+                # # Note: original code expects "object_relation" keys from the model.
+                # output_dict["object_relation"] = chat_output_json["object_relation"]
+                output_dict["functional_connection"] = chat_output_json["functional_connection"]
                 output_dict["reason"] = chat_output_json["reason"]
             except:
-                output_dict["object_relation"] = "FAIL"
+                output_dict["functional_connection"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                # exit(1)
+                logger.warning(f"[ERROR] functional object relations failed to parse or no content returned")
+                exit(1)
             relations.append(output_dict)
 
         # Saving the output
-        print("Saving object relations to file...")
+        logger.info("Saving object relations to file...")
         with open(Path(args.cachedir) / "cfslam_object_relations.json", "w") as f:
             json.dump(relations, f, indent=4)
     else:
+        logger.info("Loading existing object relations from file...")
         relations = json.load(open(Path(args.cachedir) / "cfslam_object_relations.json", "r"))
 
     edges_to_remove = []
@@ -1287,11 +1322,11 @@ def build_object_funcgraph(args, results, func_edges):
     if len(relations) > 0:
         for rel in relations:
             for i in range(len(rel['objects'])):
-                if "NULL" not in rel["object_relation"][i]:
-                    func_edges.append((rel["interactable element"]["id"], -1, rel["objects"][i]["id"], rel["object_relation"][i]))
+                if "NULL" not in rel["functional_connection"][i]:
+                    func_edges.append((rel["interactable element"]["id"], -1, rel["objects"][i]["id"], rel["functional_connection"][i]))
 
         func_edges = list(set(func_edges))
-        print(f"Created 3D funcgraph with {len(func_edges)} edges")
+        logger.info(f"Created 3D funcgraph with {len(func_edges)} edges")
         with open(Path(Path(args.cachedir).parent / "cfslam_funcgraph_edges.pkl"), "wb") as f:
             pkl.dump(func_edges, f)
 
@@ -1319,6 +1354,7 @@ def concatenate_images_horizontal(images, dist_images):
 
 
 def prune_graph(args, results, func_edges):
+    logger.debug("Pruning functional graph with LLAVA...")
     from openfungraph.llava.llava_model_16 import LlavaModel16
     from openfungraph.slam.slam_classes import MapObjectList
 
@@ -1447,15 +1483,16 @@ def prune_graph(args, results, func_edges):
                  in the right image. You should provide your illustration, reason, and the confidence score between 0 to 1.
                  Format your answer with: Illustration: ...  Confidence: ... Reason: ...
             '''
-            # console.print("[bold red]User:[/bold red] " + query)
+            logger.debug("User: " + query)
             outputs = chat.infer(
                 query = query,
                 images = [concat_image],
             )
-            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            logger.debug("LLaVA: " + outputs)    # bold green
             captions_list.append(outputs)
         
         if not (Path(savedir_debug) / ("prune_graph_" + str(inter_ele_idx) +".json")).exists():
+            logger.info(f"Pruning graph for interactable element {inter_ele_idx} with {len(obj_idxs)} objects...")
             input_dict = {
                 'inter_ele_idx': inter_ele_idx,
                 'inter_ele_center': list(inter_ele['bbox'].center),
@@ -1485,36 +1522,44 @@ def prune_graph(args, results, func_edges):
                 "reason": the list of reasons why you make the judgment, with the same length as 'confidence'.
             """
 
-            chat_completion = client.chat.completions.create(
-                # model="gpt-3.5-turbo",
-                # model="gpt-4",
-                model="gpt-4o-mini",
-                # model="gpt-5-mini",
+            content = gpt_complete_with_fallback(
                 messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
-                timeout=60,  # Timeout in seconds
+                timeout=TIMEOUT,
+                primary_model="gpt-4o-mini",
+                secondary_model="gpt-5-mini",
             )
+            content = clean_json_string(content)
+            logger.debug(f"GPT response content: {content}")
             output_dict = input_dict
             try:
-                # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion.choices[0].message.content)
-                # If the output is a valid JSON, then add it to the output dictionary
+                chat_output_json = json.loads(content) if content else None
                 output_dict["confidence"] = chat_output_json["confidence"]
                 output_dict["reason"] = chat_output_json["reason"]
             except:
                 output_dict["confidence"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                # exit(1)
+                logger.warning(f"[ERROR] Pruning graph failed to parse or no content returned.")
+                exit(1)
             # Saving the output
-            print("Saving pruning graph to file...")
+            logger.info("Saving pruning graph to file...")
             with open(Path(savedir_debug) / ("prune_graph_" + str(inter_ele_idx) +".json"), "w") as f:
                 json.dump(output_dict, f, indent=4)
         else:
+            logger.info(f"Loading existing pruning graph for interactable element {inter_ele_idx} from file...")
             output_dict = json.load(open(Path(savedir_debug) / ("prune_graph_" + str(inter_ele_idx) +".json"), "r"))
         for edge in func_edges:
             if edge[0] == output_dict["inter_ele_idx"]:
                 for i, obj_idx in enumerate(output_dict["obj_idxs"]):
                     if edge[2] == obj_idx:
-                        edge[4] *= output_dict["confidence"][i]
+                        logger.debug(f"edge[4] type={type(edge[4])}, value={edge[4]!r}")
+                        logger.debug(f"confidence type={type(output_dict['confidence'][i])}, value={output_dict['confidence'][i]!r}")
+                        # if confidernce is a string, use 0 value
+                        if isinstance(output_dict["confidence"][i], str):
+                            edge[4] = 0.0
+                        else:
+                            edge[4] *= output_dict["confidence"][i]
+                        # edge[4] = float(edge[4]) * float(output_dict["confidence"][i])
+
         
     for obj_idx, inter_ele_idxs in phase_3_dict.items():
         obj = scene_map[obj_idx]
@@ -1579,15 +1624,16 @@ def prune_graph(args, results, func_edges):
                  in the right image. You should provide your illustration, reason, and the confidence score between 0 to 1.
                  Format your answer with: Illustration: ...  Confidence: ... Reason: ...
             '''
-            # console.print("[bold red]User:[/bold red] " + query)
+            logger.debug("User: " + query)
             outputs = chat.infer(
                 query = query,
                 images = [concat_image],
             )
-            # console.print("[bold green]LLaVA:[/bold green] " + outputs)
+            logger.debug("LLaVA: " + outputs)    # bold green
             captions_list.append(outputs)
         
         if not (Path(savedir_debug) / ("prune_graph_" + str(obj_idx) +".json")).exists():
+            logger.info(f"Pruning graph for object {obj_idx} with {len(inter_ele_idxs)} interactable elements...")
             input_dict = {
                 'obj_idx': obj_idx,
                 'obj_name': obj['refined_obj_tag'],
@@ -1614,31 +1660,30 @@ def prune_graph(args, results, func_edges):
                 "reason": the list of reasons why you make the judgement, with the same length as 'confidence'.
             """
 
-            chat_completion = client.chat.completions.create(
-                # model="gpt-3.5-turbo",
-                # model="gpt-4",
-                model="gpt-4o-mini",
-                # model="gpt-5-mini",
+            content = gpt_complete_with_fallback(
                 messages=[{"role": "user", "content": DEFAULT_PROMPT + "\n\n" + input_json_str}],
-                timeout=60,  # Timeout in seconds
+                timeout=TIMEOUT,
+                primary_model="gpt-4o-mini",
+                secondary_model="gpt-5-mini",
             )
-
+            content = clean_json_string(content)
+            logger.debug(f"GPT response content: {content}")
             output_dict = input_dict
             try:
-                # Attempt to parse the output as a JSON
-                chat_output_json = json.loads(chat_completion.choices[0].message.content)
-                # If the output is a valid JSON, then add it to the output dictionary
+                chat_output_json = json.loads(content) if content else None
                 output_dict["confidence"] = chat_output_json["confidence"]
                 output_dict["reason"] = chat_output_json["reason"]
             except:
                 output_dict["confidence"] = "FAIL"
                 output_dict["reason"] = "FAIL"
-                # exit(1)
+                logger.warning(f"[ERROR] Pruning graph failed to parse or no content returned")
+                exit(1)
             # Saving the output
-            print("Saving pruning graph to file...")
+            logger.info("Saving pruning graph to file...")
             with open(Path(savedir_debug) / ("prune_graph_" + str(obj_idx) +".json"), "w") as f:
                 json.dump(output_dict, f, indent=4)
         else:
+            logger.info(f"Loading existing pruning graph for object {obj_idx} from file...")
             output_dict = json.load(open(Path(savedir_debug) / ("prune_graph_" + str(obj_idx) +".json"), "r"))
         for edge in func_edges:
             if edge[2] == output_dict["obj_idx"]:
@@ -1649,10 +1694,9 @@ def prune_graph(args, results, func_edges):
                         elif len(edge) == 4:
                             edge.append(output_dict["confidence"][i])
     edge_file = Path(args.cachedir).parent / "cfslam_funcgraph_edges.pkl"
-    with open(Path(edge_file.split('.')[-2]+'_confidence.pkl'), "wb") as f:
+    with open(Path(str(edge_file).split('.')[-2]+'_confidence.pkl'), "wb") as f:
         pkl.dump(func_edges, f)
-        print('Save edges with confidence!')
-    
+        logger.info('Save edges with confidence!')
     chat.delete()
 
 
@@ -1680,6 +1724,8 @@ def main():
     refine_node_captions(args)
 
     results, part_results, scenegraph_edges = build_rigid_funcgraph(args, results, part_results)
+    args.mapfile = args.mapfile.replace('.pkl.gz', '_updated_rigid.pkl.gz')
+    args.part_file = args.part_file.replace('.pkl.gz', '_updated_rigid.pkl.gz')
 
     # remote alignment 
     args.cachedir = args.dataset_root + '/' + args.scene_name + '/others'
@@ -1691,6 +1737,7 @@ def main():
     refine_node_captions(args)
 
     results = filter_remote_interactable_objects(args, results)  # store results
+    args.mapfile = args.mapfile.replace('.pkl.gz', '_updated_remote.pkl.gz')
 
     scenegraph_edges = build_object_funcgraph(args, results, scenegraph_edges)     # store edges
     
