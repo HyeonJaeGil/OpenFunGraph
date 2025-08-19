@@ -1,6 +1,8 @@
 '''
-The script is used to extract Grounded SAM results on a posed RGB-D dataset. 
-The results will be dumped to a folder under the scene folder. 
+The script is used to extract Grounded SAM results on a posed RGB-D dataset.
+It can generate either the full scene results or the part-based results.
+The results will be dumped to a folder under the scene folder.
+Use ``--mode part`` to enable part-based processing.
 '''
 
 import os
@@ -76,6 +78,10 @@ def get_parser() -> argparse.ArgumentParser:
     )
     
     parser.add_argument("--scene_id", type=str, default="train_3")
+
+    parser.add_argument(
+        "--mode", type=str, default="scene", choices=["scene", "part"],
+        help="Processing mode. Use 'part' for part-level results." )
     
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=-1)
@@ -233,33 +239,35 @@ def main(args: argparse.Namespace):
     )
 
     global_classes = set()
-    
-    if args.class_set in ["ram"]:
-       
+
+    if args.mode != "part" and args.class_set in ["ram"]:
+
         tagging_model = ram(pretrained=RAM_CHECKPOINT_PATH,
                                         image_size=384,
                                         vit='swin_l')
-            
+
         tagging_model = tagging_model.eval().to(args.device)
-        
+
         # initialize Tag2Text
         tagging_transform = TS.Compose([
             TS.Resize((384, 384)),
-            TS.ToTensor(), 
+            TS.ToTensor(),
             TS.Normalize(mean=[0.485, 0.456, 0.406],
                          std=[0.229, 0.224, 0.225]),
         ])
-        
+
         classes = None
     elif args.class_set == "none":
         classes = ['item']
+    elif args.mode == "part":
+        classes = None
     else:
         raise ValueError("Unknown args.class_set: ", args.class_set)
 
-    if args.class_set not in ["ram"]:
-        print("There are total", len(classes), "classes to detect. ")
-    elif args.class_set == "none":
+    if args.class_set == "none":
         print("Skipping tagging and detection models. ")
+    elif args.class_set not in ["ram"]:
+        print("There are total", len(classes), "classes to detect. ")
     else:
         print(f"{args.class_set} will be used to detect classes. ")
         
@@ -273,8 +281,12 @@ def main(args: argparse.Namespace):
 
         color_path = Path(color_path)
         
-        vis_save_path = color_path.parent.parent / f"gsa_vis_{save_name}" / color_path.name
-        detections_save_path = color_path.parent.parent / f"gsa_detections_{save_name}" / color_path.name
+        if args.mode == "part":
+            vis_save_path = color_path.parent.parent / "part" / f"gsa_vis_{save_name}" / color_path.name
+            detections_save_path = color_path.parent.parent / "part" / f"gsa_detections_{save_name}" / color_path.name
+        else:
+            vis_save_path = color_path.parent.parent / f"gsa_vis_{save_name}" / color_path.name
+            detections_save_path = color_path.parent.parent / f"gsa_detections_{save_name}" / color_path.name
         detections_save_path = detections_save_path.with_suffix(".pkl.gz")
         
         os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
@@ -292,12 +304,16 @@ def main(args: argparse.Namespace):
                 image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # Convert to RGB color space
         image_pil = Image.fromarray(image_rgb)
-        
-        ### Tag2Text ###
-        if args.class_set in ["ram"]:
+        caption = None
+        text_prompt = None
+
+        if args.mode == "part":
+            add_classes = ["handle", "button", "knob", "drawer", "door", "oven", "closet", "window", "remote", "radiator", "bathhub", "sink"]
+            classes = add_classes
+        elif args.class_set in ["ram"]:
             raw_image = image_pil.resize((384, 384))
             raw_image = tagging_transform(raw_image).unsqueeze(0).to(args.device)
-            
+
             if args.class_set == "ram":
                 res = inference_ram(raw_image , tagging_model)
                 caption="NA"
@@ -305,14 +321,14 @@ def main(args: argparse.Namespace):
             # Currently ", " is better for detecting single tags
             # while ". " is a little worse in some case
             text_prompt=res[0].replace(' |', ',')
-            
+
             add_classes = ["other item", "door", "window", "drawer", "closet", "chest", "cabinet", "dresser", "radiator", "remote", "electric outlet", "trashcan"]
             remove_classes = [
                 "room", "kitchen", "office", "house", "home", "building", "corner",
-                "shadow", "carpet", "photo", "shade", "stall", "space", "aquarium", 
-                "apartment", "image", "city", "blue", "skylight", "hallway", 
+                "shadow", "carpet", "photo", "shade", "stall", "space", "aquarium",
+                "apartment", "image", "city", "blue", "skylight", "hallway",
                 "bureau", "modern", "salon", "doorway", "wooden floor", "bedroom", "tile", "wood wall",
-                "wall paper", "wallpaper", "polka dot", "dormitory", "hardwood floor", "wood floor", 
+                "wall paper", "wallpaper", "polka dot", "dormitory", "hardwood floor", "wood floor",
                 "mattress", "carpet", "plain", "sheet", "subway", "sun", "glass wall", "glass floor", "wall lamp", "glass door",
                 "screen door", "hard wood", "ceiling", "grass", "close-up", "basement", "cement", "molding", "socket",
                 "wood", "hardwood", "carpet", "rug", "heater", "concrete", "wall clock", "corridor"
@@ -325,7 +341,7 @@ def main(args: argparse.Namespace):
                 remove_classes += bg_classes
 
             classes = process_tag_classes(
-                text_prompt, 
+                text_prompt,
                 add_classes = add_classes,
                 remove_classes = remove_classes,
             )
@@ -418,7 +434,7 @@ def main(args: argparse.Namespace):
             "text_feats": text_feats,
         }
         
-        if args.class_set in ["ram"]:
+        if args.mode != "part" and args.class_set in ["ram"]:
             results["tagging_caption"] = caption
             results["tagging_text_prompt"] = text_prompt
         
@@ -428,7 +444,12 @@ def main(args: argparse.Namespace):
             pickle.dump(results, f)
     
     # save global classes
-    with open(args.dataset_root / args.scene_id / f"gsa_classes_{save_name}.json", "w") as f:
+    if args.mode == "part":
+        class_dir = args.dataset_root / args.scene_id / "part"
+    else:
+        class_dir = args.dataset_root / args.scene_id
+    os.makedirs(class_dir, exist_ok=True)
+    with open(class_dir / f"gsa_classes_{save_name}.json", "w") as f:
         json.dump(list(global_classes), f)
         
 
