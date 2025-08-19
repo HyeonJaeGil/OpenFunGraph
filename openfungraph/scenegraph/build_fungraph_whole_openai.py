@@ -24,7 +24,30 @@ from transformers import logging as hf_logging
 from openfungraph.llava.llava_model_16 import LlavaModel16
 from openfungraph.slam.slam_classes import MapObjectList
 from openfungraph.scenegraph.GPTPrompt import GPTPrompt
+from loguru import logger
+import sys
+from datetime import datetime
+from pathlib import Path
 
+# Set up logging
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+log_filename = LOGS_DIR / f"debug_{timestamp}.log"
+logger.remove()
+format = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> <cyan>{name}:{function}</cyan> | "
+    "<level>{level}</level> | <level>{message}</level>"
+)
+logger.add(sys.stderr, format=format, level="INFO")
+allowed_levels = {"DEBUG", "INFO", "WARNING"}
+logger.add(
+    log_filename,
+    format=format,
+    filter=lambda record: record["level"].name in allowed_levels,
+    rotation="10 MB",
+    compression="zip"
+)
 
 torch.autograd.set_grad_enabled(False)
 hf_logging.set_verbosity_error()
