@@ -8,6 +8,17 @@ stride: 1
 image_height: null # if null, it will be determined by dataconfig
 image_width: null # if null, it will be determined by dataconfig
 
+# GSA generation
+mode: scene
+box_threshold: 0.25
+text_threshold: 0.25
+nms_threshold: 0.5
+class_set: ram
+detector: dino
+add_bg_classes: !!bool False
+accumu_classes: !!bool False
+exp_suffix: null
+
 # Input detections
 gsa_variant: ram
 detection_folder_name: gsa_detections_${gsa_variant}
