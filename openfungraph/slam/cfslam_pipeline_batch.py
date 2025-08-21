@@ -143,24 +143,29 @@ def main(cfg : DictConfig):
     viser_server = None
     frame_handles = []
     object_handles = {}
+    point_size_slider = None
     if cfg.get("use_viser", False):
         try:
             import viser
 
             viser_server = viser.ViserServer()
+            point_size_slider = viser_server.gui.add_slider(
+                label="point_size", min=0.001, max=0.05, step=0.001, initial_value=0.01
+            )
         except Exception as e:
             print(f"Failed to launch viser server: {e}")
             cfg.use_viser = False
 
         def update_viser(frame_idx, fg_list, bg_list, obj_list):
-            nonlocal frame_handles, object_handles
+            nonlocal frame_handles, object_handles, point_size_slider
 
             # Hide previous frame detections
             for h in frame_handles:
                 h.visible = False
             frame_handles = []
 
-            frame_ns = f"frame_{frame_idx}"
+            point_size = point_size_slider.value if point_size_slider else 0.01
+            frame_ns = f"frame/frame_{frame_idx}"
             for det_list, name in ((fg_list, "fg_detection"), (bg_list, "bg_detection")):
                 for det_idx, det in enumerate(det_list):
                     pts = np.asarray(det["pcd"].points)
@@ -170,7 +175,10 @@ def main(cfg : DictConfig):
                     col = np.asarray(class_colors[str(cid)])
                     cols = np.tile(col, (pts.shape[0], 1))
                     handle = viser_server.add_point_cloud(
-                        f"{frame_ns}/{name}/{det_idx}", points=pts, colors=cols
+                        f"{frame_ns}/{name}/{det_idx}",
+                        points=pts,
+                        colors=cols,
+                        point_size=point_size,
                     )
                     frame_handles.append(handle)
 
@@ -194,9 +202,12 @@ def main(cfg : DictConfig):
                     handle = object_handles[path]
                     handle.points = pts
                     handle.colors = cols
+                    handle.point_size = point_size
                     handle.visible = True
                 else:
-                    handle = viser_server.add_point_cloud(path, points=pts, colors=cols)
+                    handle = viser_server.add_point_cloud(
+                        path, points=pts, colors=cols, point_size=point_size
+                    )
                     object_handles[path] = handle
 
     for idx in trange(len(dataset)):
