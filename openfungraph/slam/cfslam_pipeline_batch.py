@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import gzip
 import pickle
+import time
 import numpy as np
 import open3d as o3d
 import torch
@@ -130,15 +131,102 @@ def main(cfg : DictConfig):
     classes, class_colors = create_or_load_colors(cfg, cfg.color_file_name)
 
     objects = MapObjectList(device=cfg.device)
-    
+
     if not cfg.skip_bg:
-        # Handle the background detection separately 
+        # Handle the background detection separately
         # Each class of them are fused into the map as a single object
         bg_objects = {
             c: None for c in BG_CLASSES
         }
     else:
         bg_objects = None
+
+    viser_server = None
+    frame_handles = []
+    object_handles = {}
+    point_size_slider = None
+    if cfg.get("use_viser", False):
+        try:
+            import viser
+
+            viser_server = viser.ViserServer()
+            point_size_slider = viser_server.gui.add_slider(
+                label="point_size", min=0.001, max=0.05, step=0.001, initial_value=0.01
+            )
+        except Exception as e:
+            print(f"Failed to launch viser server: {e}")
+            cfg.use_viser = False
+
+        def update_viser(frame_idx, fg_list, bg_list, obj_list):
+            nonlocal frame_handles, object_handles, point_size_slider
+
+            # Hide previous frame detections
+            for h in frame_handles:
+                h.visible = False
+            frame_handles = []
+
+            point_size = point_size_slider.value if point_size_slider else 0.01
+            frame_ns = f"frame/frame_{frame_idx}"
+            frame_handle = viser_server.scene.add_frame(frame_ns)
+            frame_handles.append(frame_handle)
+            for det_list, name in ((fg_list, "fg_detection"), (bg_list, "bg_detection")):
+                for det_idx, det in enumerate(det_list):
+                    pts = np.asarray(det["pcd"].points)
+                    if pts.size == 0:
+                        continue
+                    cid = det["class_id"][0] if isinstance(det["class_id"], list) else det["class_id"]
+                    col = np.asarray(class_colors[str(cid)])
+                    cols = np.tile(col, (pts.shape[0], 1))
+                    viser_server.scene.add_point_cloud(
+                        f"{frame_ns}/{name}/{det_idx}",
+                        points=pts,
+                        colors=cols,
+                        point_size=point_size,
+                    )
+
+            # Remove handles of objects that no longer exist
+            for path in list(object_handles.keys()):
+                idx = int(path.split("_")[-1])
+                if idx >= len(obj_list):
+                    object_handles[path].visible = False
+                    del object_handles[path]
+
+            # Update or create handles for current objects
+            for i, obj in enumerate(obj_list):
+                pts = np.asarray(obj["pcd"].points)
+                if pts.size == 0:
+                    continue
+                cid = obj["class_id"][0] if isinstance(obj["class_id"], list) else obj["class_id"]
+                col = np.asarray(class_colors[str(cid)])
+                cols = np.tile(col, (pts.shape[0], 1))
+                path = f"object/object_{i}"
+                if path in object_handles:
+                    handle = object_handles[path]
+                    handle.points = pts
+                    handle.colors = cols
+                    handle.point_size = point_size
+                    handle.visible = True
+                else:
+                    handle = viser_server.scene.add_point_cloud(
+                        path, points=pts, colors=cols, point_size=point_size
+                    )
+                    object_handles[path] = handle
+        def upload_final_objects(obj_list):
+            point_size = point_size_slider.value if point_size_slider else 0.01
+            for i, obj in enumerate(obj_list):
+                pts = np.asarray(obj['pcd'].points)
+                if pts.size == 0:
+                    continue
+                cid = obj['class_id'][0] if isinstance(obj['class_id'], list) else obj['class_id']
+                col = np.asarray(class_colors[str(cid)])
+                cols = np.tile(col, (pts.shape[0], 1))
+                viser_server.scene.add_point_cloud(
+                    f"final_object/object_{i}",
+                    points=pts,
+                    colors=cols,
+                    point_size=point_size,
+                )
+
 
     for idx in trange(len(dataset)):
         # get color image
@@ -195,7 +283,10 @@ def main(cfg : DictConfig):
             color_path = color_path,
             part_reg = cfg.part_reg,
         )
-        
+
+        if cfg.get("use_viser", False) and len(fg_detection_list) == 0:
+            update_viser(idx, fg_detection_list, bg_detection_list, objects)
+
         if len(bg_detection_list) > 0:
             for detected_object in bg_detection_list:
                 class_name = detected_object['class_name'][0]
@@ -242,9 +333,9 @@ def main(cfg : DictConfig):
         
         # Threshold sims according to cfg. Set to negative infinity if below threshold
         agg_sim[agg_sim < cfg.sim_threshold] = float('-inf')
-        
+
         objects = merge_detections_to_objects(cfg, fg_detection_list, objects, agg_sim)
-        
+
         # Perform post-processing periodically if told so
         if cfg.denoise_interval > 0 and (idx+1) % cfg.denoise_interval == 0:
             objects = denoise_objects(cfg, objects)
@@ -252,6 +343,9 @@ def main(cfg : DictConfig):
             objects = filter_objects(cfg, objects)
         if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
             objects = merge_objects(cfg, objects)
+
+        if cfg.get("use_viser", False):
+            update_viser(idx, fg_detection_list, bg_detection_list, objects)
 
     if bg_objects is not None:
         bg_objects = MapObjectList([_ for _ in bg_objects.values() if _ is not None])
@@ -287,7 +381,7 @@ def main(cfg : DictConfig):
     
     objects = filter_objects(cfg, objects)
     objects = merge_objects(cfg, objects)
-    
+
     # Save again the full point cloud after the post-processing
     if cfg.save_pcd:
         results['objects'] = objects.to_serializable()
@@ -295,6 +389,15 @@ def main(cfg : DictConfig):
         with gzip.open(pcd_save_path, "wb") as f:
             pickle.dump(results, f)
         print(f"Saved full point cloud after post-processing to {pcd_save_path}")
+
+    if cfg.get("use_viser", False):
+        upload_final_objects(objects)
+        print("Viser server running. Press Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
         
 if __name__ == "__main__":
     main()

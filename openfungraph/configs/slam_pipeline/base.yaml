@@ -77,6 +77,7 @@ save_suffix: exp
 # Visualization
 debug_render: !!bool False     # If True, the vis.run() will be called and used for debugging
 class_agnostic: !!bool False   # If set, the color will be set by instance, rather than most common class
+use_viser: !!bool False
 
 render_camera_path: "replica_room0.json"
 
