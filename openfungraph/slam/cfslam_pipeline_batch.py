@@ -5,14 +5,15 @@ The script is used to model Grounded SAM detections in 3D, it assumes the tag2te
 # Standard library imports
 import copy
 from datetime import datetime
-import os
-from pathlib import Path
-import gzip
-import pickle
-import numpy as np
-import open3d as o3d
-import torch
-from tqdm import trange
+    import os
+    from pathlib import Path
+    import gzip
+    import pickle
+    import time
+    import numpy as np
+    import open3d as o3d
+    import torch
+    from tqdm import trange
 
 import hydra
 import omegaconf
@@ -166,6 +167,8 @@ def main(cfg : DictConfig):
 
             point_size = point_size_slider.value if point_size_slider else 0.01
             frame_ns = f"frame/frame_{frame_idx}"
+            frame_handle = viser_server.scene.add_frame(frame_ns)
+            frame_handles.append(frame_handle)
             for det_list, name in ((fg_list, "fg_detection"), (bg_list, "bg_detection")):
                 for det_idx, det in enumerate(det_list):
                     pts = np.asarray(det["pcd"].points)
@@ -174,13 +177,12 @@ def main(cfg : DictConfig):
                     cid = det["class_id"][0] if isinstance(det["class_id"], list) else det["class_id"]
                     col = np.asarray(class_colors[str(cid)])
                     cols = np.tile(col, (pts.shape[0], 1))
-                    handle = viser_server.add_point_cloud(
+                    viser_server.scene.add_point_cloud(
                         f"{frame_ns}/{name}/{det_idx}",
                         points=pts,
                         colors=cols,
                         point_size=point_size,
                     )
-                    frame_handles.append(handle)
 
             # Remove handles of objects that no longer exist
             for path in list(object_handles.keys()):
@@ -205,7 +207,7 @@ def main(cfg : DictConfig):
                     handle.point_size = point_size
                     handle.visible = True
                 else:
-                    handle = viser_server.add_point_cloud(
+                    handle = viser_server.scene.add_point_cloud(
                         path, points=pts, colors=cols, point_size=point_size
                     )
                     object_handles[path] = handle
@@ -363,7 +365,7 @@ def main(cfg : DictConfig):
     
     objects = filter_objects(cfg, objects)
     objects = merge_objects(cfg, objects)
-    
+
     # Save again the full point cloud after the post-processing
     if cfg.save_pcd:
         results['objects'] = objects.to_serializable()
@@ -371,6 +373,15 @@ def main(cfg : DictConfig):
         with gzip.open(pcd_save_path, "wb") as f:
             pickle.dump(results, f)
         print(f"Saved full point cloud after post-processing to {pcd_save_path}")
+
+    if cfg.get("use_viser", False):
+        update_viser(len(dataset), [], [], objects)
+        print("Viser server running. Press Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
         
 if __name__ == "__main__":
     main()
