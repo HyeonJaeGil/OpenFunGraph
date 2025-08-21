@@ -6,7 +6,6 @@ Use ``--mode part`` to enable part-based processing.
 '''
 
 import os
-import argparse
 from pathlib import Path
 from typing import Any, List
 from PIL import Image
@@ -23,6 +22,10 @@ import torch
 import torchvision
 import supervision as sv
 from tqdm import trange
+
+import hydra
+import omegaconf
+from omegaconf import DictConfig
 
 from openfungraph.dataset.datasets_common import get_dataset
 from openfungraph.utils.vis import vis_result_fast, vis_result_slow_caption
@@ -67,49 +70,22 @@ SAM_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./sam_vit_h_4b8939.pth")
 RAM_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./ram_swin_large_14m.pth")
 
 
-def get_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset_root", type=Path, required=True,
-    )
-    parser.add_argument(
-        "--dataset_config", type=str, required=True,
-        help="This path may need to be changed depending on where you run this script. "
-    )
-    
-    parser.add_argument("--scene_id", type=str, default="train_3")
+def process_cfg(cfg: DictConfig):
+    cfg.dataset_root = Path(cfg.dataset_root)
+    cfg.dataset_config = Path(cfg.dataset_config)
 
-    parser.add_argument(
-        "--mode", type=str, default="scene", choices=["scene", "part"],
-        help="Processing mode. Use 'part' for part-level results." )
-    
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=-1)
-    parser.add_argument("--stride", type=int, default=1)
+    if cfg.dataset_config.name != "multiscan.yaml":
+        dataset_cfg = omegaconf.OmegaConf.load(cfg.dataset_config)
+        if cfg.image_height is None:
+            cfg.image_height = dataset_cfg.camera_params.image_height
+        if cfg.image_width is None:
+            cfg.image_width = dataset_cfg.camera_params.image_width
+        print(f"Setting image height and width to {cfg.image_height} x {cfg.image_width}")
+    else:
+        assert cfg.image_height is not None and cfg.image_width is not None, \
+            "For multiscan dataset, image height and width must be specified"
 
-    parser.add_argument("--desired-height", type=int, default=480)
-    parser.add_argument("--desired-width", type=int, default=640)
-
-    parser.add_argument("--box_threshold", type=float, default=0.25)
-    parser.add_argument("--text_threshold", type=float, default=0.25)
-    parser.add_argument("--nms_threshold", type=float, default=0.5)
-
-    parser.add_argument("--class_set", type=str, default="scene", 
-                        choices=["ram", "none"], 
-                        help="If none, no tagging and detection will be used and the SAM will be run in dense sampling mode. ")
-    parser.add_argument("--detector", type=str, default="dino", 
-                        choices=["dino"])
-    parser.add_argument("--add_bg_classes", action="store_true", 
-                        help="If set, add background classes (wall, floor, ceiling) to the class set. ")
-    parser.add_argument("--accumu_classes", action="store_true",
-                        help="if set, the class set will be accumulated over frames")
-    
-    parser.add_argument("--device", type=str, default="cuda")
-    
-    parser.add_argument("--exp_suffix", type=str, default=None,
-                        help="The suffix of the folder that the results will be saved to. ")
-    
-    return parser
+    return cfg
 
 
 # Prompting SAM with detected boxes
@@ -202,51 +178,53 @@ def process_tag_classes(text_prompt:str, add_classes:List[str]=[], remove_classe
     return classes
 
     
-def main(args: argparse.Namespace):
+@hydra.main(version_base=None, config_path="../configs/slam_pipeline", config_name="base")
+def main(cfg: DictConfig):
+    cfg = process_cfg(cfg)
     ### Initialize the Grounding DINO model ###
     grounding_dino_model = Model(
-        model_config_path=GROUNDING_DINO_CONFIG_PATH, 
-        model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH, 
-        device=args.device
+        model_config_path=GROUNDING_DINO_CONFIG_PATH,
+        model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH,
+        device=cfg.device
     )
 
     ### Initialize the SAM model ###
-    if args.class_set == "none":
-        mask_generator = get_sam_mask_generator(args.device)
+    if cfg.class_set == "none":
+        mask_generator = get_sam_mask_generator(cfg.device)
     else:
-        sam_predictor = get_sam_predictor(args.device)
-    
+        sam_predictor = get_sam_predictor(cfg.device)
+
     ###
     # Initialize the CLIP model
     clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
         "ViT-H-14", "laion2b_s32b_b79k"
     )
-    clip_model = clip_model.to(args.device)
+    clip_model = clip_model.to(cfg.device)
     clip_tokenizer = open_clip.get_tokenizer("ViT-H-14")
-    
+
     # Initialize the dataset
     dataset = get_dataset(
-        dataconfig=args.dataset_config,
-        start=args.start,
-        end=args.end,
-        stride=args.stride,
-        basedir=args.dataset_root,
-        sequence=args.scene_id,
-        desired_height=args.desired_height,
-        desired_width=args.desired_width,
+        dataconfig=cfg.dataset_config,
+        start=cfg.start,
+        end=cfg.end,
+        stride=cfg.stride,
+        basedir=cfg.dataset_root,
+        sequence=cfg.scene_id,
+        desired_height=cfg.image_height,
+        desired_width=cfg.image_width,
         device="cpu",
         dtype=torch.float,
     )
 
     global_classes = set()
 
-    if args.mode != "part" and args.class_set in ["ram"]:
+    if cfg.mode != "part" and cfg.class_set in ["ram"]:
 
         tagging_model = ram(pretrained=RAM_CHECKPOINT_PATH,
                                         image_size=384,
                                         vit='swin_l')
 
-        tagging_model = tagging_model.eval().to(args.device)
+        tagging_model = tagging_model.eval().to(cfg.device)
 
         # initialize Tag2Text
         tagging_transform = TS.Compose([
@@ -257,46 +235,46 @@ def main(args: argparse.Namespace):
         ])
 
         classes = None
-    elif args.class_set == "none":
+    elif cfg.class_set == "none":
         classes = ['item']
-    elif args.mode == "part":
+    elif cfg.mode == "part":
         classes = None
     else:
-        raise ValueError("Unknown args.class_set: ", args.class_set)
+        raise ValueError("Unknown class_set: ", cfg.class_set)
 
-    if args.class_set == "none":
+    if cfg.class_set == "none":
         print("Skipping tagging and detection models. ")
-    elif args.class_set not in ["ram"]:
+    elif cfg.class_set not in ["ram"]:
         print("There are total", len(classes), "classes to detect. ")
     else:
-        print(f"{args.class_set} will be used to detect classes. ")
-        
-    save_name = f"{args.class_set}"
-    if args.exp_suffix:
-        save_name += f"_{args.exp_suffix}"
+        print(f"{cfg.class_set} will be used to detect classes. ")
+
+    save_name = f"{cfg.class_set}"
+    if cfg.exp_suffix:
+        save_name += f"_{cfg.exp_suffix}"
 
     for idx in trange(len(dataset)):
         ### Relevant paths and load image ###
         color_path = dataset.color_paths[idx]
 
         color_path = Path(color_path)
-        
-        if args.mode == "part":
+
+        if cfg.mode == "part":
             vis_save_path = color_path.parent.parent / "part" / f"gsa_vis_{save_name}" / color_path.name
             detections_save_path = color_path.parent.parent / "part" / f"gsa_detections_{save_name}" / color_path.name
         else:
             vis_save_path = color_path.parent.parent / f"gsa_vis_{save_name}" / color_path.name
             detections_save_path = color_path.parent.parent / f"gsa_detections_{save_name}" / color_path.name
         detections_save_path = detections_save_path.with_suffix(".pkl.gz")
-        
+
         os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
         os.makedirs(os.path.dirname(detections_save_path), exist_ok=True)
-        
+
         # opencv can't read Path objects... sigh...
         color_path = str(color_path)
         vis_save_path = str(vis_save_path)
         detections_save_path = str(detections_save_path)
-        
+
         image = cv2.imread(color_path) # This will in BGR color space
         # rotate it
         if hasattr(dataset, 'camera_axis'):
@@ -307,14 +285,14 @@ def main(args: argparse.Namespace):
         caption = None
         text_prompt = None
 
-        if args.mode == "part":
+        if cfg.mode == "part":
             add_classes = ["handle", "button", "knob", "drawer", "door", "oven", "closet", "window", "remote", "radiator", "bathhub", "sink"]
             classes = add_classes
-        elif args.class_set in ["ram"]:
+        elif cfg.class_set in ["ram"]:
             raw_image = image_pil.resize((384, 384))
-            raw_image = tagging_transform(raw_image).unsqueeze(0).to(args.device)
+            raw_image = tagging_transform(raw_image).unsqueeze(0).to(cfg.device)
 
-            if args.class_set == "ram":
+            if cfg.class_set == "ram":
                 res = inference_ram(raw_image , tagging_model)
                 caption="NA"
 
@@ -335,7 +313,7 @@ def main(args: argparse.Namespace):
             ]
             bg_classes = ["wall", "floor"]
 
-            if args.add_bg_classes:
+            if cfg.add_bg_classes:
                 add_classes += bg_classes
             else:
                 remove_classes += bg_classes
@@ -345,16 +323,16 @@ def main(args: argparse.Namespace):
                 add_classes = add_classes,
                 remove_classes = remove_classes,
             )
-            
+
         # add classes to global classes
         global_classes.update(classes)
-        
-        if args.accumu_classes:
+
+        if cfg.accumu_classes:
             # Use all the classes that have been seen so far
             classes = list(global_classes)
-            
+
         ### Detection and segmentation ###
-        if args.class_set == "none":
+        if cfg.class_set == "none":
             # Directly use SAM in dense sampling mode to get segmentation
             mask, xyxy, conf = get_sam_segmentation_dense(mask_generator, image_rgb)
             detections = sv.Detections(
@@ -364,45 +342,45 @@ def main(args: argparse.Namespace):
                 mask=mask,
             )
             image_crops, image_feats, text_feats = compute_clip_features(
-                image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, args.device)
+                image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, cfg.device)
 
             ### Visualize results ###
             annotated_image, labels = vis_result_fast(
                 image, detections, classes, instance_random_color=True)
-            
+
             cv2.imwrite(vis_save_path, annotated_image)
         else:
-            if args.detector == "dino":
+            if cfg.detector == "dino":
                 # Using GroundingDINO to detect and SAM to segment
                 detections = grounding_dino_model.predict_with_classes(
                     image=image, # This function expects a BGR image...
                     classes=classes,
-                    box_threshold=args.box_threshold,
-                    text_threshold=args.text_threshold,
+                    box_threshold=cfg.box_threshold,
+                    text_threshold=cfg.text_threshold,
                 )
-            
+
                 if len(detections.class_id) > 0:
                     ### Non-maximum suppression ###
                     # print(f"Before NMS: {len(detections.xyxy)} boxes")
                     nms_idx = torchvision.ops.nms(
-                        torch.from_numpy(detections.xyxy), 
-                        torch.from_numpy(detections.confidence), 
-                        args.nms_threshold
+                        torch.from_numpy(detections.xyxy),
+                        torch.from_numpy(detections.confidence),
+                        cfg.nms_threshold
                     ).numpy().tolist()
                     # print(f"After NMS: {len(detections.xyxy)} boxes")
 
                     detections.xyxy = detections.xyxy[nms_idx]
                     detections.confidence = detections.confidence[nms_idx]
                     detections.class_id = detections.class_id[nms_idx]
-                    
+
                     # Somehow some detections will have class_id=-1, remove them
                     valid_idx = detections.class_id != -1
                     detections.xyxy = detections.xyxy[valid_idx]
                     detections.confidence = detections.confidence[valid_idx]
                     detections.class_id = detections.class_id[valid_idx]
-                
+
             if len(detections.class_id) > 0:
-                
+
                 ### Segment Anything ###
                 detections.mask = get_sam_segmentation_from_xyxy(
                     sam_predictor=sam_predictor,
@@ -410,18 +388,18 @@ def main(args: argparse.Namespace):
                     xyxy=detections.xyxy
                 )
 
-                # Compute and save the clip features of detections  
+                # Compute and save the clip features of detections
                 image_crops, image_feats, text_feats = compute_clip_features(
-                    image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, args.device)
+                    image_rgb, detections, clip_model, clip_preprocess, clip_tokenizer, classes, cfg.device)
             else:
                 image_crops, image_feats, text_feats = [], [], []
-            
+
             ### Visualize results ###
             annotated_image, labels = vis_result_fast(image, detections, classes)
-            
+
             # save the annotated grounded-sam image
             cv2.imwrite(vis_save_path, annotated_image)
-        
+
         # Convert the detections to a dict. The elements are in np.array
         results = {
             "xyxy": detections.xyxy,
@@ -433,27 +411,26 @@ def main(args: argparse.Namespace):
             "image_feats": image_feats,
             "text_feats": text_feats,
         }
-        
-        if args.mode != "part" and args.class_set in ["ram"]:
+
+        if cfg.mode != "part" and cfg.class_set in ["ram"]:
             results["tagging_caption"] = caption
             results["tagging_text_prompt"] = text_prompt
-        
+
         # save the detections using pickle
         # Here we use gzip to compress the file, which could reduce the file size by 500x
         with gzip.open(detections_save_path, "wb") as f:
             pickle.dump(results, f)
-    
+
     # save global classes
-    if args.mode == "part":
-        class_dir = args.dataset_root / args.scene_id / "part"
+    if cfg.mode == "part":
+        class_dir = cfg.dataset_root / cfg.scene_id / "part"
     else:
-        class_dir = args.dataset_root / args.scene_id
+        class_dir = cfg.dataset_root / cfg.scene_id
     os.makedirs(class_dir, exist_ok=True)
     with open(class_dir / f"gsa_classes_{save_name}.json", "w") as f:
         json.dump(list(global_classes), f)
-        
+
 
 if __name__ == "__main__":
-    parser = get_parser()
-    args = parser.parse_args()
-    main(args)
+    main()
+
