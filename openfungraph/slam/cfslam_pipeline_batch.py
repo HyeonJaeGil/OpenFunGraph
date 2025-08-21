@@ -5,15 +5,15 @@ The script is used to model Grounded SAM detections in 3D, it assumes the tag2te
 # Standard library imports
 import copy
 from datetime import datetime
-    import os
-    from pathlib import Path
-    import gzip
-    import pickle
-    import time
-    import numpy as np
-    import open3d as o3d
-    import torch
-    from tqdm import trange
+import os
+from pathlib import Path
+import gzip
+import pickle
+import time
+import numpy as np
+import open3d as o3d
+import torch
+from tqdm import trange
 
 import hydra
 import omegaconf
@@ -211,6 +211,22 @@ def main(cfg : DictConfig):
                         path, points=pts, colors=cols, point_size=point_size
                     )
                     object_handles[path] = handle
+        def upload_final_objects(obj_list):
+            point_size = point_size_slider.value if point_size_slider else 0.01
+            for i, obj in enumerate(obj_list):
+                pts = np.asarray(obj['pcd'].points)
+                if pts.size == 0:
+                    continue
+                cid = obj['class_id'][0] if isinstance(obj['class_id'], list) else obj['class_id']
+                col = np.asarray(class_colors[str(cid)])
+                cols = np.tile(col, (pts.shape[0], 1))
+                viser_server.scene.add_point_cloud(
+                    f"final_object/object_{i}",
+                    points=pts,
+                    colors=cols,
+                    point_size=point_size,
+                )
+
 
     for idx in trange(len(dataset)):
         # get color image
@@ -375,7 +391,7 @@ def main(cfg : DictConfig):
         print(f"Saved full point cloud after post-processing to {pcd_save_path}")
 
     if cfg.get("use_viser", False):
-        update_viser(len(dataset), [], [], objects)
+        upload_final_objects(objects)
         print("Viser server running. Press Ctrl+C to exit.")
         try:
             while True:
