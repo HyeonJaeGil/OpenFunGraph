@@ -130,15 +130,74 @@ def main(cfg : DictConfig):
     classes, class_colors = create_or_load_colors(cfg, cfg.color_file_name)
 
     objects = MapObjectList(device=cfg.device)
-    
+
     if not cfg.skip_bg:
-        # Handle the background detection separately 
+        # Handle the background detection separately
         # Each class of them are fused into the map as a single object
         bg_objects = {
             c: None for c in BG_CLASSES
         }
     else:
         bg_objects = None
+
+    viser_server = None
+    frame_handles = []
+    object_handles = {}
+    if cfg.get("use_viser", False):
+        try:
+            import viser
+
+            viser_server = viser.ViserServer()
+        except Exception as e:
+            print(f"Failed to launch viser server: {e}")
+            cfg.use_viser = False
+
+        def update_viser(frame_idx, fg_list, bg_list, obj_list):
+            nonlocal frame_handles, object_handles
+
+            # Hide previous frame detections
+            for h in frame_handles:
+                h.visible = False
+            frame_handles = []
+
+            frame_ns = f"frame_{frame_idx}"
+            for det_list, name in ((fg_list, "fg_detection"), (bg_list, "bg_detection")):
+                for det_idx, det in enumerate(det_list):
+                    pts = np.asarray(det["pcd"].points)
+                    if pts.size == 0:
+                        continue
+                    cid = det["class_id"][0] if isinstance(det["class_id"], list) else det["class_id"]
+                    col = np.asarray(class_colors[str(cid)])
+                    cols = np.tile(col, (pts.shape[0], 1))
+                    handle = viser_server.add_point_cloud(
+                        f"{frame_ns}/{name}/{det_idx}", points=pts, colors=cols
+                    )
+                    frame_handles.append(handle)
+
+            # Remove handles of objects that no longer exist
+            for path in list(object_handles.keys()):
+                idx = int(path.split("_")[-1])
+                if idx >= len(obj_list):
+                    object_handles[path].visible = False
+                    del object_handles[path]
+
+            # Update or create handles for current objects
+            for i, obj in enumerate(obj_list):
+                pts = np.asarray(obj["pcd"].points)
+                if pts.size == 0:
+                    continue
+                cid = obj["class_id"][0] if isinstance(obj["class_id"], list) else obj["class_id"]
+                col = np.asarray(class_colors[str(cid)])
+                cols = np.tile(col, (pts.shape[0], 1))
+                path = f"object/object_{i}"
+                if path in object_handles:
+                    handle = object_handles[path]
+                    handle.points = pts
+                    handle.colors = cols
+                    handle.visible = True
+                else:
+                    handle = viser_server.add_point_cloud(path, points=pts, colors=cols)
+                    object_handles[path] = handle
 
     for idx in trange(len(dataset)):
         # get color image
@@ -195,7 +254,10 @@ def main(cfg : DictConfig):
             color_path = color_path,
             part_reg = cfg.part_reg,
         )
-        
+
+        if cfg.get("use_viser", False) and len(fg_detection_list) == 0:
+            update_viser(idx, fg_detection_list, bg_detection_list, objects)
+
         if len(bg_detection_list) > 0:
             for detected_object in bg_detection_list:
                 class_name = detected_object['class_name'][0]
@@ -242,9 +304,9 @@ def main(cfg : DictConfig):
         
         # Threshold sims according to cfg. Set to negative infinity if below threshold
         agg_sim[agg_sim < cfg.sim_threshold] = float('-inf')
-        
+
         objects = merge_detections_to_objects(cfg, fg_detection_list, objects, agg_sim)
-        
+
         # Perform post-processing periodically if told so
         if cfg.denoise_interval > 0 and (idx+1) % cfg.denoise_interval == 0:
             objects = denoise_objects(cfg, objects)
@@ -252,6 +314,9 @@ def main(cfg : DictConfig):
             objects = filter_objects(cfg, objects)
         if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
             objects = merge_objects(cfg, objects)
+
+        if cfg.get("use_viser", False):
+            update_viser(idx, fg_detection_list, bg_detection_list, objects)
 
     if bg_objects is not None:
         bg_objects = MapObjectList([_ for _ in bg_objects.values() if _ is not None])
